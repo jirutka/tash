@@ -1,0 +1,5 @@
+#!/usr/bin/env tash
+# vim: set ts=2 ft=sh:
+
+@ Say hello
+	- echo Hello, world!
