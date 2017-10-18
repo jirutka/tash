@@ -1,0 +1,445 @@
+#!/bin/sh
+# vim: set ts=4:
+#---help---
+# Usage: tash [options] ( SCRIPT... | VAR=VALUE... )
+#
+# Arguments:
+#   SCRIPT           Path of the tash script to execute.
+#   VAR=VALUE        Set variable.
+#
+# Options:
+#   -a --ask         Ask before running each task.
+#   -C --no-colors   Disable coloured output.
+#   -d --dry-run     Don't execute any commands, only print what would be done.
+#   -o --only RANGE  Task numbers to run (e.g. 1,5..8,12..).
+#   -s --skip RANGE  Task numbers to skip (e.g. ..12,18..19,22).
+#   -h --help        Show this message and exit.
+#   -V --version     Print version and exit.
+#
+# Environment Variables:
+#   AWK              The awk executable to use.
+#   SED              The sed executable to use.
+#
+# Please report bugs at <https://github.com/jirutka/tash/issues>.
+#---help---
+set -eu
+
+#-------------------------- Global variables --------------------------#
+
+readonly __PROGNAME='tash'
+readonly __VERSION='0.0.0.dev'
+
+# Escape sequences, may be nulled in `__disable_colors()`.
+ESC_RESET='\033[0m'
+ESC_BOLD='\033[1m'
+ESC_DIM='\033[2m'
+ESC_RED='\033[31m'
+ESC_GREEN='\033[32m'
+ESC_YELLOW='\033[33m'
+ESC_BLUE='\033[34m'
+ESC_MANGENTA='\033[35m'
+ESC_CYAN='\033[36m'
+ESC_WHITE='\033[37m'
+
+: ${AWK:="awk"}
+: ${SED:="sed"}
+
+# Variables set by CLI options.
+__ask=n
+__dryrun=n
+__only_tasks=''
+__scripts=''
+__skip_tasks=''
+
+# Internal state.
+__base_dir=$(pwd)
+__finished_tasks=0
+__nl=''
+__skip=n
+__task_name=''
+__task_num=0
+
+
+#---------------------------- Compatibility ---------------------------#
+
+# Set pipefail if supported.
+if ( set -o pipefail 2>/dev/null ); then
+	set -o pipefail
+fi
+
+# For compatibility with systems that does not have "realpath" command.
+if ! command -v realpath >/dev/null; then
+	realpath() {
+		printf %s "$(cd "$(dirname "$1")"; pwd)/$(basename "$1")"
+	}
+fi
+
+
+#-------------------------- Public Functions --------------------------#
+
+# Starts a new task "block". This function should not be called directly in
+# user scripts, it's inserted in place of "@" by the preprocessor.
+#
+# You may override this function (to define "hooks") and use
+# `default_start_task "$@"` to execute the flow for starting new task.
+#
+# $1: the task title
+start_task() {
+	default_start_task "$@"
+}
+
+# Starts a new task "block". This function is called by `start_task`.
+#
+# $1: the task title
+default_start_task() {
+	__task_name="$1"
+	: $(( __task_num++ ))
+
+	if __is_skipped; then
+		__print_skip_task
+		__skip=y
+	else
+		__print_start_task
+		[ "$__ask" = n ] || __prompt_task
+		cd "$__base_dir"
+	fi
+}
+
+# Ends the current task "block". This function should not be called directly
+# in user scripts, it's inserted after the last step of the task by the
+# preprocessor.
+#
+# You may override this function (to define "hooks") and use
+# `default_end_task "$@"` to execute the flow for ending the task.
+end_task() {
+	default_end_task "$@"
+}
+
+# Ends the current task "block". This function is called by `end_task`.
+default_end_task() {
+	if [ "$__skip" = n ]; then
+		: $(( __finished_tasks++ ))
+	fi
+	__skip=n
+}
+
+# Prints and evaluates (unless running with --dry-run) the given shell code.
+# Output of the command is redirected to stderr.
+#
+# This function should not be called directly in user scripts, it's inserted
+# in place of "-" by the preprocessor.
+#
+# You may override this function (to define "hooks") and use
+# `default_step "$@"` to execute the flow for running the step.
+#
+# $1: the shell code to evaluate
+step() {
+	default_step "$@"
+}
+
+# Prints and evaluates the given shell code. This function is called by `step`.
+#
+# $1: the shell code to evaluate
+default_step() {
+	__print_command "$*"
+
+	#[ "$__ask" = n ] || __prompt_task
+	[ "$__dryrun" = n ] || return 0
+	eval "$1" >&2 || on_failure "$1"
+}
+
+# Includes (executes) another script.
+#
+# $1: path of the script to include
+include() {
+	default_include "$@"
+}
+
+# Includes (executes) another script. This function is called by `include`.
+#
+# $1: path of the script to include
+default_include() {
+	[ -r "$1" ] || die "Script does not exist or not readable: $1"
+
+	# source instead of eval to get more useful error messages...
+	__preprocess_script "$1" > "$__tmpfile" \
+		|| die "Failed to preprocess script: $1"
+
+	. "$__tmpfile"
+}
+
+# This function is called after some step fail.
+on_failure() {
+	fail
+}
+
+# Changes, or prints (if no argument given) the base directory.
+#
+# $1: new base directory
+base_dir() {
+	if [ $# -eq 0 ]; then
+		echo "$__base_dir"
+	else
+		[ -d "$1" ] || die "Directory '$1' does not exist!"
+		__base_dir=$(realpath "$1")
+	fi
+}
+
+# Skips all the remaining steps of the current task.
+skip() {
+	__skip=y
+	echo 'Skipping all the remaining steps of this task.' >&2
+}
+
+die() {
+	printf "${ESC_BOLD}${ESC_RED}ERROR:${ESC_RESET} %s\n" "$@"
+	exit 1
+}
+
+fail() {
+	[ $# -gt 0 ] || fail "$(printf "Task %02d has failed!" $__task_num)"
+	printf "${ESC_BOLD}${ESC_RED}FAILED:${ESC_RESET} %s\n" "$@"
+	exit 2
+}
+
+# TODO: rename?
+is_dryrun() {
+	[ "$__dryrun" = y ]
+}
+
+
+#------------------------- Internal Functions -------------------------#
+
+__prompt_task() {
+	printf 'What to do? (c)ontinue, (s)kip, (a)bort: '
+	local choice; read choice
+
+	case "$choice" in
+		a | abort) exit 0;;
+		c | continue | '') ;;
+		s | skip) __skip=y;;
+		*) __prompt_task;;
+	esac
+}
+
+# Returns 0 if the current task should be skipped, 1 otherwise.
+__is_skipped() {
+	if [ "$__only_tasks" ]; then
+		! __is_in_range "$__task_num" "$__only_tasks"
+	elif [ "$__skip_tasks" ]; then
+		__is_in_range "$__task_num" "$__skip_tasks"
+	else
+		return 1
+	fi
+}
+
+# Tests if the given number ($1) is in the specified range(s) ($2).
+#
+# Range format:
+#   1     -> n == 1
+#   ..13  -> n <= 13
+#   3..   -> n >= 3
+#   2..42 -> n >= 2 && n <= 42
+#
+# $1: the tested number
+# $2: ranges separated by space or newline
+__is_in_range() {
+	set +e
+	printf '%s\n' $2 | $AWK -v num="$1" '
+		{
+			if ($0 ~ /^[0-9]+$/) {
+				if (num == $0) { exit 5 }
+			} else if (length($0) > 2 && match($0, /^[0-9]*\.\.[0-9]*$/)) {
+				split($0, range, /\.\./)
+				if ((range[1] == "" || num >= range[1]) && (range[2] == "" || num <= range[2])) {
+					exit 5
+				}
+			} else {
+				exit 6
+			}
+		}'
+	local status=$?
+	set -e
+
+	case $status in
+		0) return 1;;  # not in range
+		5) return 0;;  # in range
+		6) die "Invalid range: $2";;
+		*) die 'AWK failed';;
+	esac
+}
+
+# Preprocesses the specified script and prints the result to stdout.
+# $1: the script path
+__preprocess_script() {
+	$AWK '
+		function indent_size() {
+			match($0, /^[ \t]+/)
+			return RLENGTH
+		}
+		function on_start_task(name) {
+			print("start_task \"" name "\"")
+			print("if [ \"$__skip\" = n ]; then")
+		}
+		function on_end_task() {
+			print("fi")
+			print("end_task")
+		}
+		function on_command(cmd) {
+			gsub(/\\\n/, "\\\\\n", cmd)  # escape escaped newline
+			gsub("\"", "\\\"", cmd)      # escape double quotes
+			print("step \"" cmd "\"")
+		}
+		BEGIN {
+			in_task = -1
+			in_cmd = -1
+			cmd_buff = ""
+			blanks_buff = ""
+		}
+		{
+			if ($0 !~ /^[ \t]*$/) {
+				indent = indent_size()
+
+				if (indent < in_cmd) {
+					on_command(cmd_buff)
+					printf(blanks_buff)
+					cmd_buff = ""
+					blanks_buff = ""
+					in_cmd = -1
+				}
+				if (indent < in_task) {
+					on_end_task()
+					in_task = -1
+				}
+			}
+			if (match($0, /^[ \t]*@[ \t]/)) {
+				in_task = RLENGTH - 1
+				on_start_task(substr($0, RLENGTH + 1))
+			} else if (match($0, /^[ \t]*-[ \t]/)) {
+				in_cmd = RLENGTH - 1
+				cmd_buff = substr($0, RLENGTH + 1)
+			} else if (in_cmd > -1) {
+				if ($0 ~ /^[ \t]*$/) {
+					blanks_buff = blanks_buff "\n"
+				} else {
+					cmd_buff = cmd_buff "\n" blanks_buff substr($0, in_cmd + 1)
+					blanks_buff = ""
+				}
+			} else {
+				print
+			}
+		}
+		END {
+			if (in_cmd > -1) {
+				on_command(cmd_buff)
+				printf(blanks_buff)
+			}
+			if (in_task > -1) {
+				on_end_task()
+			}
+		}
+	' "$1"
+}
+
+__print_command() {
+	local IFS=$'\n'
+	printf -- "${ESC_DIM}${ESC_WHITE}> %s${ESC_RESET}\n" $1
+}
+
+__print_skip_task() {
+	printf "$__nl${ESC_BOLD}${ESC_YELLOW}> %02d: %s [SKIPPED]${ESC_RESET}\n" \
+		$__task_num "$__task_name"
+	__nl="\n"
+}
+
+__print_start_task() {
+	printf "$__nl${ESC_BOLD}${ESC_CYAN}> %02d: %s${ESC_RESET}\n" \
+		$__task_num "$__task_name"
+	__nl="\n"
+}
+
+__print_summary() {
+	printf "\n${ESC_BOLD}${ESC_GREEN}FINISHED %d tasks${ESC_RESET}\n" \
+		$__finished_tasks
+}
+
+__disable_colors() {
+	ESC_RESET=''
+	ESC_BOLD=''
+	ESC_DIM=''
+	ESC_RED=''
+	ESC_GREEN=''
+	ESC_YELLOW=''
+	ESC_BLUE=''
+	ESC_MANGENTA=''
+	ESC_CYAN=''
+	ESC_WHITE=''
+}
+
+__version() {
+	echo "$__PROGNAME $__VERSION"
+	exit 0
+}
+
+# $1: exit status
+__help() {
+	cat "$0" \
+		| $SED -En '/^#---help---/,/^#---help---/p' \
+		| $SED -E 's/^# ?//; 1d;$d;'
+	exit ${1:-0}
+}
+
+__cleanup() {
+	set +e
+	[ -e "$__tmpfile" ] && rm "$__tmpfile"
+}
+
+
+#-----------------------------  M a i n  ------------------------------#
+
+while [ $# -ne 0 ]; do
+	n=1
+	case "$1" in
+		-a | --ask) __ask=y;;
+		-C | --no-colors) __disable_colors;;
+		-d | --dry-run) __dryrun=y;;
+		-o | --only) __only_tasks="${__only_tasks:-},${2:-}"; n=2;;
+		-s | --skip) __skip_tasks="${__skip_tasks:-},${2:-}"; n=2;;
+		-h | --help) __help 0;;
+		-V | --version) __version;;
+		--) shift; break;;
+		-*) __help 1;;
+		_*=*) die "Illegal argument: $1";;
+		*=*) eval "$1";;
+		*) __scripts="${__scripts}$1\\";;
+	esac
+	shift $n
+done
+unset n
+
+while [ $# -ne 0 ]; do
+	__scripts="${__scripts}$1\\"; shift
+done
+
+[ "$__scripts" ] || __help 1
+
+if [ "$__only_tasks" ] && [ "$__skip_tasks" ]; then
+	die 'Options --only and --skip cannot be used together.'
+fi
+
+__only_tasks=$(printf %s "$__only_tasks" | tr ',' ' ')
+__skip_tasks=$(printf %s "$__skip_tasks" | tr ',' ' ')
+
+readonly ESC_RESET ESC_BOLD ESC_DIM ESC_RED ESC_GREEN ESC_YELLOW ESC_BLUE \
+	ESC_MANGENTA ESC_CYAN ESC_WHITE
+
+__tmpfile=$(mktemp)
+
+trap __cleanup EXIT HUP INT TERM
+
+while [ "$__scripts" ]; do
+	include "${__scripts%%\\*}"
+	__scripts="${__scripts#*\\}"
+done
+
+__print_summary
